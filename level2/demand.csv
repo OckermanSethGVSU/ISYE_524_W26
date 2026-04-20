@@ -1,0 +1,6 @@
+demand_id,node_id,component_id,quantity
+DEMAND_1,CUST_1,LRU_2,3
+DEMAND_2,CUST_2,LRU_2,3
+DEMAND_3,CUST_2,LRU_3,2
+DEMAND_4,CUST_3,LRU_4,1
+DEMAND_5,CUST_4,LRU_4,3
