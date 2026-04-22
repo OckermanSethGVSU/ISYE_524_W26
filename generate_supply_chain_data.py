@@ -170,21 +170,44 @@ class GeneratorConfig:
 
     repair_cost_multiplier_by_type: dict[str, float] = field(
         default_factory=lambda: {
-            "local_shop": 1.30,
+            "specialized_shop": 1.40,
+            "local_shop": 1.20,
             "regional_warehouse": 1.00,
             "central_depot": 0.85,
-            "specialized_shop": 1.15,
+        }
+    )
+    repair_base_cost_by_class: dict[str, int] = field(
+        default_factory=lambda: {
+            "sru": 18,
+            "lru": 24,
+        }
+    )
+    repair_combination_cost_by_child_class: dict[str, float] = field(
+        default_factory=lambda: {
+            "part": 14.0,
+            "sru": 6.0,
         }
     )
     repair_time_multiplier_by_type: dict[str, float] = field(
         default_factory=lambda: {
-            "local_shop": 1.10,
-            "regional_warehouse": 1.00,
+            "specialized_shop": 0.80,
+            "local_shop": 0.95,
+            "regional_warehouse": 1.10,
             "central_depot": 1.25,
-            "specialized_shop": 1.20,
         }
     )
-
+    repair_base_time_by_class: dict[str, int] = field(
+        default_factory=lambda: {
+            "sru": 8,
+            "lru": 16,
+        }
+    )
+    repair_combination_time_by_child_class: dict[str, float] = field(
+        default_factory=lambda: {
+            "part": 2.0,
+            "sru": 7.0,
+        }
+    )
     # Arc generation controls. Connections are hierarchical: customers connect
     # to nearby local shops, local shops to regional warehouses, and so on.
     customer_local_connections: int = 2
@@ -210,13 +233,22 @@ class GeneratorConfig:
         }
     )
 
-    # Component-level replacement/procurement costs. Shared final-level PARTs
-    # intentionally have no direct component cost in components.csv.
+    # Initial placeholder component-cost ranges. Exported LRU/SRU costs are
+    # overwritten from the same BOM-aware formula used by component_multipler.csv.
+    # Keeping this draw preserves the seeded structure of existing data sets.
+    # Shared final-level PARTs intentionally have no direct component cost.
     component_cost_ranges: dict[str, tuple[int, int] | None] = field(
         default_factory=lambda: {
             "lru": (900, 1500),
             "sru": (150, 500),
             "part": None,
+        }
+    )
+    component_movement_cost_ranges: dict[str, tuple[int, int]] = field(
+        default_factory=lambda: {
+            "lru": (8, 16),
+            "sru": (3, 8),
+            "part": (1, 3),
         }
     )
 
@@ -240,11 +272,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--complexity",
         type=int,
-        choices=[0, 1],
+        choices=[0, 1, 2, 3],
         default=0,
         help=(
             "Model complexity level. Level 0 omits node repair capacity and "
-            "node-specific repair cost. Level 1 includes those columns."
+            "node-specific repair cost. Level 1 adds repair cost, and "
+            "Level 2 also adds repair time. Level 3 also adds component "
+            "movement cost."
         ),
     )
     parser.add_argument(
@@ -435,6 +469,17 @@ def component_cost_for_class(
     return rng.randint(low, high)
 
 
+def component_movement_cost_for_class(
+    component_class: str,
+    config: GeneratorConfig,
+    rng: random.Random,
+) -> int:
+    """Assign intrinsic movement cost by component class."""
+
+    low, high = config.component_movement_cost_ranges[component_class]
+    return rng.randint(low, high)
+
+
 def make_component(
     component_id: str,
     component_class: str,
@@ -446,7 +491,7 @@ def make_component(
 ) -> dict[str, object]:
     """Create one component row."""
 
-    return {
+    component = {
         "component_id": component_id,
         "component_class": component_class,
         "subsystem": rng.choice(SUBSYSTEMS),
@@ -456,6 +501,7 @@ def make_component(
         "is_shared": is_shared,
         "specialized_only": specialized_only,
     }
+    return component
 
 
 def component_sort_key(component_id: object) -> tuple[int, list[int]]:
@@ -530,6 +576,9 @@ def generate_components_and_bom(
                 )
 
     mark_specialized_only_parts(components, bom_rows, config, rng)
+    assign_component_repair_costs(components, bom_rows, config)
+    if config.complexity >= 3:
+        assign_component_movement_costs(components, config)
     components.sort(
         key=lambda row: (int(row["indenture_level"]), component_sort_key(row["component_id"]))
     )
@@ -582,9 +631,57 @@ def components_used_by_bom(
     ]
 
 
+def assign_component_repair_costs(
+    components: list[dict[str, object]],
+    bom_rows: list[dict[str, object]],
+    config: GeneratorConfig,
+) -> None:
+    """Set LRU/SRU component costs to the unmultiplied repair option cost."""
+
+    component_by_id = {str(component["component_id"]): component for component in components}
+    children_by_parent: dict[str, list[dict[str, object]]] = {}
+    for row in bom_rows:
+        children_by_parent.setdefault(str(row["parent_component_id"]), []).append(row)
+
+    for component in components:
+        component_class = str(component["component_class"])
+        if component_class == "part":
+            component["component_cost"] = ""
+            continue
+
+        base_repair_cost = config.repair_base_cost_by_class[component_class]
+        combination_cost = 0.0
+        for child in children_by_parent.get(str(component["component_id"]), []):
+            child_component = component_by_id[str(child["child_component_id"])]
+            child_class = str(child_component["component_class"])
+            quantity_required = int(child["quantity_required"])
+            combination_cost += (
+                config.repair_combination_cost_by_child_class[child_class]
+                * quantity_required
+            )
+
+        component["component_cost"] = round(base_repair_cost + combination_cost)
+
+
+def assign_component_movement_costs(
+    components: list[dict[str, object]],
+    config: GeneratorConfig,
+) -> None:
+    """Set component movement costs without perturbing the main data RNG."""
+
+    movement_rng = random.Random(config.seed + 4000)
+    for component in components:
+        component["movement_cost"] = component_movement_cost_for_class(
+            str(component["component_class"]),
+            config,
+            movement_rng,
+        )
+
+
 def enriched_bom_rows(
     components: list[dict[str, object]],
     bom_rows: list[dict[str, object]],
+    config: GeneratorConfig,
 ) -> list[dict[str, object]]:
     """Add component class and cost details to BOM relationships."""
 
@@ -593,18 +690,20 @@ def enriched_bom_rows(
     for row in bom_rows:
         parent = component_by_id[str(row["parent_component_id"])]
         child = component_by_id[str(row["child_component_id"])]
-        rows.append(
-            {
-                "parent_component_id": parent["component_id"],
-                "parent_component_class": parent["component_class"],
-                "parent_component_cost": parent["component_cost"],
-                "child_component_id": child["component_id"],
-                "child_component_class": child["component_class"],
-                "child_component_cost": child["component_cost"],
-                "child_specialized_only": child["specialized_only"],
-                "quantity_required": row["quantity_required"],
-            }
-        )
+        enriched_row = {
+            "parent_component_id": parent["component_id"],
+            "parent_component_class": parent["component_class"],
+            "parent_component_cost": parent["component_cost"],
+            "child_component_id": child["component_id"],
+            "child_component_class": child["component_class"],
+            "child_component_cost": child["component_cost"],
+            "child_specialized_only": child["specialized_only"],
+            "quantity_required": row["quantity_required"],
+        }
+        if config.complexity >= 3:
+            enriched_row["parent_component_movement_cost"] = parent["movement_cost"]
+            enriched_row["child_component_movement_cost"] = child["movement_cost"]
+        rows.append(enriched_row)
     return rows
 
 
@@ -902,16 +1001,22 @@ def generate_demand(
 def generate_repair_options(
     nodes: list[dict[str, object]],
     components: list[dict[str, object]],
+    bom_rows: list[dict[str, object]],
     config: GeneratorConfig,
 ) -> list[dict[str, object]]:
     """Generate valid node-component repair choices.
 
     A repair option exists when the node's repair capability is at least the
-    component's repair difficulty. Customers have capability zero, so they will
-    not appear here.
+    component's repair difficulty. Only LRUs and SRUs are repairable at this
+    level; shared PARTs are not emitted as repair options. Customers have
+    capability zero, so they will not appear here.
     """
 
     repair_options: list[dict[str, object]] = []
+    component_by_id = {str(component["component_id"]): component for component in components}
+    children_by_parent: dict[str, list[dict[str, object]]] = {}
+    for row in bom_rows:
+        children_by_parent.setdefault(str(row["parent_component_id"]), []).append(row)
 
     for node in nodes:
         node_type = str(node["node_type"])
@@ -920,6 +1025,9 @@ def generate_repair_options(
 
         repair_capability = int(node["repair_capability"])
         for component in components:
+            if int(component["indenture_level"]) >= 3:
+                continue
+
             repair_difficulty = int(component["repair_difficulty"])
             if repair_capability < repair_difficulty:
                 continue
@@ -929,12 +1037,25 @@ def generate_repair_options(
                 "component_id": component["component_id"],
             }
             if config.complexity >= 1:
-                time_multiplier = config.repair_time_multiplier_by_type[node_type]
-                repair_time = max(1, round(repair_difficulty * time_multiplier))
                 cost_multiplier = config.repair_cost_multiplier_by_type[node_type]
-                repair_cost = round(repair_difficulty * 10 * cost_multiplier)
-                repair_option["repair_cost"] = repair_cost
-                repair_option["repair_time"] = repair_time
+                repair_option["repair_cost_multiplier"] = cost_multiplier
+                if config.complexity >= 2:
+                    component_class = str(component["component_class"])
+                    combination_time = 0.0
+                    for child in children_by_parent.get(str(component["component_id"]), []):
+                        child_component = component_by_id[str(child["child_component_id"])]
+                        child_class = str(child_component["component_class"])
+                        quantity_required = int(child["quantity_required"])
+                        combination_time += (
+                            config.repair_combination_time_by_child_class[child_class]
+                            * quantity_required
+                        )
+
+                    time_multiplier = config.repair_time_multiplier_by_type[node_type]
+                    base_repair_time = config.repair_base_time_by_class[component_class]
+                    repair_time = max(1, round(base_repair_time + combination_time))
+                    repair_option["repair_time"] = repair_time
+                    repair_option["repair_time_multiplier"] = time_multiplier
             repair_options.append(repair_option)
 
     return repair_options
@@ -1502,6 +1623,195 @@ def write_inventory_markdown(
     )
 
 
+def write_cost_formula_markdown(path: Path, config: GeneratorConfig) -> None:
+    """Write the repair cost/time setup as Markdown."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if config.complexity < 1:
+        path.write_text(
+            "\n".join(
+                [
+                    "# Repair Cost Formula",
+                    "",
+                    "Repair cost is not generated at `--complexity 0`.",
+                    "",
+                ]
+            )
+        )
+        return
+
+    include_time = config.complexity >= 2
+    title = "Repair Cost And Time Formula" if include_time else "Repair Cost Formula"
+
+    if include_time:
+        component_rows = [
+            [
+                "`sru`",
+                config.repair_base_cost_by_class["sru"],
+                config.repair_base_time_by_class["sru"],
+                "Base repair cost/time for an `SRU`",
+            ],
+            [
+                "`lru`",
+                config.repair_base_cost_by_class["lru"],
+                config.repair_base_time_by_class["lru"],
+                "Base repair cost/time for an `LRU`",
+            ],
+        ]
+        component_headers = ["Component Class", "Cost Value", "Time Value", "Meaning"]
+        combination_rows = [
+            [
+                "child `part`",
+                config.repair_combination_cost_by_child_class["part"],
+                config.repair_combination_time_by_child_class["part"],
+                "Combination cost/time per required `PART` child",
+            ],
+            [
+                "child `sru`",
+                config.repair_combination_cost_by_child_class["sru"],
+                config.repair_combination_time_by_child_class["sru"],
+                "Combination cost/time per required `SRU` child",
+            ],
+        ]
+        combination_headers = ["Child Class", "Cost Value", "Time Value", "Meaning"]
+        location_rows = [
+            [
+                "`specialized_shop`",
+                config.repair_cost_multiplier_by_type["specialized_shop"],
+                config.repair_time_multiplier_by_type["specialized_shop"],
+            ],
+            [
+                "`local_shop`",
+                config.repair_cost_multiplier_by_type["local_shop"],
+                config.repair_time_multiplier_by_type["local_shop"],
+            ],
+            [
+                "`regional_warehouse`",
+                config.repair_cost_multiplier_by_type["regional_warehouse"],
+                config.repair_time_multiplier_by_type["regional_warehouse"],
+            ],
+            [
+                "`central_depot`",
+                config.repair_cost_multiplier_by_type["central_depot"],
+                config.repair_time_multiplier_by_type["central_depot"],
+            ],
+        ]
+        location_headers = ["Location Type", "Cost Multiplier", "Time Multiplier"]
+        formula_section = "## Formula\n" + "\n".join(
+            [
+                "```text",
+                "repair_cost = round(base_repair_cost + combination_cost)",
+                "repair_cost_multiplier = location_cost_multiplier",
+                "repair_time = round(base_repair_time + combination_time)",
+                "repair_time_multiplier = location_time_multiplier",
+                "```",
+                "",
+                "```text",
+                "base_repair_cost = repair_base_cost_by_class[component_class]",
+                "base_repair_time = repair_base_time_by_class[component_class]",
+                "```",
+                "",
+                "```text",
+                "combination_cost = sum(child_combination_cost for each BOM child)",
+                "combination_time = sum(child_combination_time for each BOM child)",
+                "```",
+                "",
+                "```text",
+                "if child is SRU:",
+                "    child_combination_cost = 6.0 * quantity_required",
+                "    child_combination_time = 7.0 * quantity_required",
+                "",
+                "if child is PART:",
+                "    child_combination_cost = 14.0 * quantity_required",
+                "    child_combination_time = 2.0 * quantity_required",
+                "```",
+                "",
+                "Specialized shops are fastest and central depots are slowest.",
+                "LRU repair takes longer than SRU repair because `LRU` assembly combines `SRU` children with a higher per-child time than `SRU` assembly uses for `PART` children.",
+            ]
+        )
+        level_description = (
+            "Only `LRU_*` and `LRU_*_*` components are repairable at `--complexity 2`. "
+            "Shared `PART_*` items are used to build repairs but are not themselves repair options."
+        )
+    else:
+        component_rows = [
+            ["`sru`", config.repair_base_cost_by_class["sru"], "Base repair cost for an `SRU`"],
+            ["`lru`", config.repair_base_cost_by_class["lru"], "Base repair cost for an `LRU`"],
+        ]
+        component_headers = ["Component Class", "Value", "Meaning"]
+        combination_rows = [
+            [
+                "child `part`",
+                config.repair_combination_cost_by_child_class["part"],
+                "Combination cost per required `PART` child",
+            ],
+            [
+                "child `sru`",
+                config.repair_combination_cost_by_child_class["sru"],
+                "Combination cost per required `SRU` child",
+            ],
+        ]
+        combination_headers = ["Child Class", "Value", "Meaning"]
+        location_rows = [
+            ["`specialized_shop`", config.repair_cost_multiplier_by_type["specialized_shop"]],
+            ["`local_shop`", config.repair_cost_multiplier_by_type["local_shop"]],
+            ["`regional_warehouse`", config.repair_cost_multiplier_by_type["regional_warehouse"]],
+            ["`central_depot`", config.repair_cost_multiplier_by_type["central_depot"]],
+        ]
+        location_headers = ["Location Type", "Multiplier"]
+        formula_section = "## Formula\n" + "\n".join(
+            [
+                "```text",
+                "repair_cost = round(base_repair_cost + combination_cost)",
+                "repair_cost_multiplier = location_multiplier",
+                "```",
+                "",
+                "```text",
+                "base_repair_cost = repair_base_cost_by_class[component_class]",
+                "```",
+                "",
+                "```text",
+                "combination_cost = sum(child_combination_cost for each BOM child)",
+                "```",
+                "",
+                "```text",
+                "if child is SRU:",
+                "    child_combination_cost = 6.0 * quantity_required",
+                "",
+                "if child is PART:",
+                "    child_combination_cost = 14.0 * quantity_required",
+                "```",
+            ]
+        )
+        level_description = (
+            "Only `LRU_*` and `LRU_*_*` components are repairable at `--complexity 1`. "
+            "Shared `PART_*` items are used to build repairs but are not themselves repair options."
+        )
+
+    path.write_text(
+        "\n\n".join(
+            [
+                f"# {title}",
+                level_description,
+                "## Component Cost Table\n"
+                + markdown_table(
+                    component_headers,
+                    component_rows,
+                ),
+                "## Child Combination Cost Table\n"
+                + markdown_table(
+                    combination_headers,
+                    combination_rows,
+                ),
+                "## Location Multiplier Table\n" + markdown_table(location_headers, location_rows),
+                formula_section,
+                "",
+            ]
+        )
+    )
+
+
 def draw_network_axis(
     axis: object,
     nodes: list[dict[str, object]],
@@ -1705,6 +2015,9 @@ def write_visualization(
     figure.savefig(output_path, dpi=200)
     plt.close(figure)
 
+    cost_formula_path = output_path.with_name(f"{output_path.stem}_cost_formula.md")
+    write_cost_formula_markdown(cost_formula_path, config)
+
 
 def write_separate_visualizations(
     output_path: Path,
@@ -1716,7 +2029,7 @@ def write_separate_visualizations(
     bom_rows: list[dict[str, object]],
     config: GeneratorConfig,
 ) -> list[Path]:
-    """Write graph PNG plus dependency-map and inventory Markdown files."""
+    """Write graph PNG plus dependency-map, inventory, and cost Markdown files."""
 
     plt = prepare_matplotlib(output_path)
     node_by_id, inventory_by_node, demand_by_node = visualization_maps(
@@ -1727,10 +2040,12 @@ def write_separate_visualizations(
     graph_path = output_path.with_name(f"{stem}_graph{suffix}")
     dependency_map_path = output_path.with_name(f"{stem}_dependency_map.md")
     inventory_path = output_path.with_name(f"{stem}_inventory.md")
+    cost_formula_path = output_path.with_name(f"{stem}_cost_formula.md")
     written_paths = [
         graph_path,
         dependency_map_path,
         inventory_path,
+        cost_formula_path,
     ]
 
     graph_figure, graph_axis = plt.subplots(figsize=(10, 8), constrained_layout=True)
@@ -1745,6 +2060,7 @@ def write_separate_visualizations(
         inventory_by_node,
         demand_by_node,
     )
+    write_cost_formula_markdown(cost_formula_path, config)
 
     return written_paths
 
@@ -1769,11 +2085,14 @@ def node_fieldnames(config: GeneratorConfig) -> list[str]:
 
 
 def repair_option_fieldnames(config: GeneratorConfig) -> list[str]:
-    """Return the repair_options.csv schema for the selected complexity level."""
+    """Return the component_multipler.csv schema for the selected complexity level."""
 
     fieldnames = ["node_id", "component_id"]
     if config.complexity >= 1:
-        fieldnames.extend(["repair_cost", "repair_time"])
+        fieldnames.append("repair_cost_multiplier")
+    if config.complexity >= 2:
+        fieldnames.append("repair_time")
+        fieldnames.append("repair_time_multiplier")
     return fieldnames
 
 
@@ -1834,9 +2153,9 @@ def main() -> None:
     )
     rng = random.Random(config.seed)
     output_dir = Path(args.output_dir)
-    obsolete_filenames = ["customers.csv"]
+    obsolete_filenames = ["customers.csv", "repair_options.csv"]
     if config.complexity == 0:
-        obsolete_filenames.extend(["components.csv", "repair_options.csv"])
+        obsolete_filenames.extend(["components.csv", "component_multipler.csv"])
     for obsolete_filename in obsolete_filenames:
         obsolete_path = output_dir / obsolete_filename
         if obsolete_path.exists():
@@ -1862,7 +2181,7 @@ def main() -> None:
         )
     arcs = generate_arcs(nodes, config)
     repair_options = (
-        generate_repair_options(nodes, components, config)
+        generate_repair_options(nodes, components, bom_rows, config)
         if config.complexity >= 1
         else []
     )
@@ -1876,33 +2195,52 @@ def main() -> None:
         node_fieldnames(config),
     )
     if config.complexity >= 1:
-        write_csv(
-            output_dir / "components.csv",
-            components,
+        component_fieldnames = [
+            "component_id",
+            "component_class",
+            "subsystem",
+            "repair_difficulty",
+            "component_cost",
+        ]
+        if config.complexity >= 3:
+            component_fieldnames.append("movement_cost")
+        component_fieldnames.extend(
             [
-                "component_id",
-                "component_class",
-                "subsystem",
-                "repair_difficulty",
-                "component_cost",
                 "indenture_level",
                 "is_shared",
                 "specialized_only",
-            ],
+            ]
         )
-    write_csv(
-        output_dir / "bom.csv",
-        enriched_bom_rows(components, bom_rows),
+        write_csv(
+            output_dir / "components.csv",
+            components,
+            component_fieldnames,
+        )
+    bom_fieldnames = [
+        "parent_component_id",
+        "parent_component_class",
+        "parent_component_cost",
+        "child_component_id",
+        "child_component_class",
+        "child_component_cost",
+    ]
+    if config.complexity >= 3:
+        bom_fieldnames.extend(
+            [
+                "parent_component_movement_cost",
+                "child_component_movement_cost",
+            ]
+        )
+    bom_fieldnames.extend(
         [
-            "parent_component_id",
-            "parent_component_class",
-            "parent_component_cost",
-            "child_component_id",
-            "child_component_class",
-            "child_component_cost",
             "child_specialized_only",
             "quantity_required",
-        ],
+        ]
+    )
+    write_csv(
+        output_dir / "bom.csv",
+        enriched_bom_rows(components, bom_rows, config),
+        bom_fieldnames,
     )
     write_csv(
         output_dir / "node_inventory.csv",
@@ -1921,7 +2259,7 @@ def main() -> None:
     )
     if config.complexity >= 1:
         write_csv(
-            output_dir / "repair_options.csv",
+            output_dir / "component_multipler.csv",
             repair_options,
             repair_option_fieldnames(config),
         )

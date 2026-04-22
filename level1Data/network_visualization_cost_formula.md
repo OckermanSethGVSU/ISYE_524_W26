@@ -24,7 +24,8 @@ Only `LRU_*` and `LRU_*_*` components are repairable at `--complexity 1`. Shared
 
 ## Formula
 ```text
-repair_cost = round((base_repair_cost + combination_cost) * location_multiplier)
+repair_cost = round(base_repair_cost + combination_cost)
+repair_cost_multiplier = location_multiplier
 ```
 
 ```text
