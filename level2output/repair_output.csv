@@ -1,0 +1,6 @@
+comp_id,node_id,qty
+LRU_2,SPEC_1,2
+LRU_2,SPEC_4,3
+LRU_3,SPEC_1,1
+LRU_4,SPEC_3,2
+LRU_4,SPEC_4,1
