@@ -20,8 +20,8 @@
 
 | customer | demand |
 | --- | --- |
-| CUST_1 | LRU_2:3 (t4:1, t6:1, t7:1), LRU_3:2 (t2:1, t7:1), LRU_4:3 (t4:1, t7:2), LRU_5:1 (t5:1) |
-| CUST_2 | LRU_1:2 (t2:1, t4:1), LRU_3:3 (t2:1, t5:1, t6:1), LRU_5:2 (t1:1, t4:1) |
-| CUST_3 | LRU_1:1 (t6:1), LRU_4:2 (t5:1, t7:1), LRU_5:3 (t3:1, t4:1, t5:1) |
-| CUST_4 | LRU_2:1 (t2:1), LRU_3:3 (t4:1, t7:2) |
+| CUST_1 | LRU_4:2 (t1:1, t4:1) |
+| CUST_2 | LRU_1:1 (t3:1) |
+| CUST_3 | LRU_1:2 (t3:1, t4:1), LRU_2:2 (t3:1, t4:1) |
+| CUST_4 | LRU_2:3 (t2:2, t4:1) |
 
