@@ -17,7 +17,7 @@ Only `LRU_*` and `LRU_*_*` components are repairable at `--complexity 1`. Shared
 ## Location Multiplier Table
 | Location Type | Multiplier |
 | --- | --- |
-| `specialized_shop` | 1.4 |
+| `specialized_shop` | 2.0 |
 | `local_shop` | 1.2 |
 | `regional_warehouse` | 1.0 |
 | `central_depot` | 0.85 |
