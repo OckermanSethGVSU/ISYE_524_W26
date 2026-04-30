@@ -1,0 +1,7 @@
+demand_id,node_id,component_id,quantity,time_slice_1,time_slice_2,time_slice_3,time_slice_4
+DEMAND_1,CUST_1,LRU_5,3,1,1,0,1
+DEMAND_2,CUST_2,LRU_1,2,1,0,1,0
+DEMAND_3,CUST_2,LRU_6,3,2,0,1,0
+DEMAND_4,CUST_3,LRU_1,2,0,0,1,1
+DEMAND_5,CUST_3,LRU_5,1,1,0,0,0
+DEMAND_6,CUST_4,LRU_4,1,0,0,1,0

@@ -1,0 +1,5 @@
+timestep,comp_id,node_id,qty
+1,LRU_2,DEPOT_1,1
+1,LRU_2,SPEC_1,5
+1,LRU_3,DEPOT_1,1
+1,LRU_5,SPEC_3,3
