@@ -75,24 +75,36 @@ class GeneratorConfig:
     counts: CountConfig = field(default_factory=CountConfig)
 
     # Repair capacity is the total number of repair jobs a node can handle in a
-    # planning period. Storage is assumed unlimited for now, so it is not listed.
+    # planning period. Levels 2 and 3 use tighter ranges so repair-time-aware
+    # instances stay meaningfully capacity-constrained. Storage is assumed
+    # unlimited for now, so it is not listed.
     repair_capacity_ranges: dict[str, tuple[int, int]] = field(
         default_factory=lambda: {
             "customer": (0, 0),
-            "local_shop": (5, 25),
-            "regional_warehouse": (40, 120),
-            "central_depot": (250, 600),
-            "specialized_shop": (30, 100),
+            "local_shop": (60, 210),
+            "regional_warehouse": (360, 960),
+            "central_depot": (1050, 2400),
+            "specialized_shop": (270, 780),
+        }
+    )
+    level3_repair_capacity_ranges: dict[str, tuple[int, int]] = field(
+        default_factory=lambda: {
+            "customer": (0, 0),
+            "local_shop": (72, 120),
+            "regional_warehouse": (144, 288),
+            "central_depot": (168, 336),
+            "specialized_shop": (108, 216),
         }
     )
 
     # Repair capability is the maximum component difficulty a node can repair.
-    # Customers cannot repair anything. Specialized shops are high skill but
-    # lower scale than depots.
+    # Customers cannot repair anything. Local shops cover simpler SRU work so
+    # their multiplier appears in exported repair-option data. Specialized
+    # shops are high skill but lower scale than depots.
     repair_capability_ranges: dict[str, tuple[int, int]] = field(
         default_factory=lambda: {
             "customer": (0, 0),
-            "local_shop": (1, 3),
+            "local_shop": (4, 5),
             "regional_warehouse": (4, 6),
             "central_depot": (8, 9),
             "specialized_shop": (7, 9),
@@ -170,7 +182,7 @@ class GeneratorConfig:
 
     repair_cost_multiplier_by_type: dict[str, float] = field(
         default_factory=lambda: {
-            "specialized_shop": 1.40,
+            "specialized_shop": 2.00,
             "local_shop": 1.20,
             "regional_warehouse": 1.00,
             "central_depot": 0.85,
@@ -193,7 +205,7 @@ class GeneratorConfig:
             "specialized_shop": 0.80,
             "local_shop": 0.95,
             "regional_warehouse": 1.10,
-            "central_depot": 1.25,
+            "central_depot": 3.00,
         }
     )
     repair_base_time_by_class: dict[str, int] = field(
@@ -206,6 +218,15 @@ class GeneratorConfig:
         default_factory=lambda: {
             "part": 2.0,
             "sru": 7.0,
+        }
+    )
+    arc_time_parameters_by_route: dict[tuple[str, str], tuple[float, int]] = field(
+        default_factory=lambda: {
+            ("customer", "local_shop"): (1.00, 2),
+            ("local_shop", "regional_warehouse"): (1.10, 3),
+            ("regional_warehouse", "central_depot"): (0.75, 1),
+            ("regional_warehouse", "specialized_shop"): (1.45, 5),
+            ("specialized_shop", "central_depot"): (1.35, 4),
         }
     )
     # Arc generation controls. Connections are hierarchical: customers connect
@@ -232,9 +253,10 @@ class GeneratorConfig:
             "part": (0, 0),
         }
     )
+    level3_demand_day_count: int = 4
 
     # Initial placeholder component-cost ranges. Exported LRU/SRU costs are
-    # overwritten from the same BOM-aware formula used by component_multipler.csv.
+    # overwritten from the same BOM-aware formula used by component_multiplier.csv.
     # Keeping this draw preserves the seeded structure of existing data sets.
     # Shared final-level PARTs intentionally have no direct component cost.
     component_cost_ranges: dict[str, tuple[int, int] | None] = field(
@@ -242,13 +264,6 @@ class GeneratorConfig:
             "lru": (900, 1500),
             "sru": (150, 500),
             "part": None,
-        }
-    )
-    component_movement_cost_ranges: dict[str, tuple[int, int]] = field(
-        default_factory=lambda: {
-            "lru": (8, 16),
-            "sru": (3, 8),
-            "part": (1, 3),
         }
     )
 
@@ -277,8 +292,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Model complexity level. Level 0 omits node repair capacity and "
             "node-specific repair cost. Level 1 adds repair cost, and "
-            "Level 2 also adds repair time. Level 3 also adds component "
-            "movement cost."
+            "Level 2 also adds repair time. Level 3 also adds multi-day demand."
         ),
     )
     parser.add_argument(
@@ -364,7 +378,12 @@ def point_for_node(
 def random_capacity(node_type: str, config: GeneratorConfig, rng: random.Random) -> int:
     """Draw repair capacity from the configured range for this node type."""
 
-    low, high = config.repair_capacity_ranges[node_type]
+    capacity_ranges = (
+        config.level3_repair_capacity_ranges
+        if config.complexity >= 2
+        else config.repair_capacity_ranges
+    )
+    low, high = capacity_ranges[node_type]
     if low == high:
         return low
     return rng.randint(low, high)
@@ -469,17 +488,6 @@ def component_cost_for_class(
     return rng.randint(low, high)
 
 
-def component_movement_cost_for_class(
-    component_class: str,
-    config: GeneratorConfig,
-    rng: random.Random,
-) -> int:
-    """Assign intrinsic movement cost by component class."""
-
-    low, high = config.component_movement_cost_ranges[component_class]
-    return rng.randint(low, high)
-
-
 def make_component(
     component_id: str,
     component_class: str,
@@ -577,8 +585,8 @@ def generate_components_and_bom(
 
     mark_specialized_only_parts(components, bom_rows, config, rng)
     assign_component_repair_costs(components, bom_rows, config)
-    if config.complexity >= 3:
-        assign_component_movement_costs(components, config)
+    if config.complexity >= 2:
+        assign_component_repair_times(components, bom_rows, config)
     components.sort(
         key=lambda row: (int(row["indenture_level"]), component_sort_key(row["component_id"]))
     )
@@ -663,19 +671,36 @@ def assign_component_repair_costs(
         component["component_cost"] = round(base_repair_cost + combination_cost)
 
 
-def assign_component_movement_costs(
+def assign_component_repair_times(
     components: list[dict[str, object]],
+    bom_rows: list[dict[str, object]],
     config: GeneratorConfig,
 ) -> None:
-    """Set component movement costs without perturbing the main data RNG."""
+    """Set LRU/SRU component repair times to the unmultiplied repair duration."""
 
-    movement_rng = random.Random(config.seed + 4000)
+    component_by_id = {str(component["component_id"]): component for component in components}
+    children_by_parent: dict[str, list[dict[str, object]]] = {}
+    for row in bom_rows:
+        children_by_parent.setdefault(str(row["parent_component_id"]), []).append(row)
+
     for component in components:
-        component["movement_cost"] = component_movement_cost_for_class(
-            str(component["component_class"]),
-            config,
-            movement_rng,
-        )
+        component_class = str(component["component_class"])
+        if component_class == "part":
+            component["repair_time"] = ""
+            continue
+
+        base_repair_time = config.repair_base_time_by_class[component_class]
+        combination_time = 0.0
+        for child in children_by_parent.get(str(component["component_id"]), []):
+            child_component = component_by_id[str(child["child_component_id"])]
+            child_class = str(child_component["component_class"])
+            quantity_required = int(child["quantity_required"])
+            combination_time += (
+                config.repair_combination_time_by_child_class[child_class]
+                * quantity_required
+            )
+
+        component["repair_time"] = max(1, round(base_repair_time + combination_time))
 
 
 def enriched_bom_rows(
@@ -683,7 +708,7 @@ def enriched_bom_rows(
     bom_rows: list[dict[str, object]],
     config: GeneratorConfig,
 ) -> list[dict[str, object]]:
-    """Add component class and cost details to BOM relationships."""
+    """Add component metadata details to BOM relationships."""
 
     component_by_id = {str(component["component_id"]): component for component in components}
     rows: list[dict[str, object]] = []
@@ -693,16 +718,18 @@ def enriched_bom_rows(
         enriched_row = {
             "parent_component_id": parent["component_id"],
             "parent_component_class": parent["component_class"],
+            "parent_component_repair_difficulty": parent["repair_difficulty"],
             "parent_component_cost": parent["component_cost"],
             "child_component_id": child["component_id"],
             "child_component_class": child["component_class"],
+            "child_component_repair_difficulty": child["repair_difficulty"],
             "child_component_cost": child["component_cost"],
             "child_specialized_only": child["specialized_only"],
             "quantity_required": row["quantity_required"],
         }
-        if config.complexity >= 3:
-            enriched_row["parent_component_movement_cost"] = parent["movement_cost"]
-            enriched_row["child_component_movement_cost"] = child["movement_cost"]
+        if config.complexity >= 2:
+            enriched_row["parent_component_repair_time"] = parent["repair_time"]
+            enriched_row["child_component_repair_time"] = child["repair_time"]
         rows.append(enriched_row)
     return rows
 
@@ -945,7 +972,8 @@ def generate_demand(
     nodes: list[dict[str, object]],
     components: list[dict[str, object]],
     config: GeneratorConfig,
-    rng: random.Random,
+    demand_rng: random.Random,
+    schedule_rng: random.Random,
 ) -> list[dict[str, object]]:
     """Generate component demand at customer nodes.
 
@@ -964,17 +992,17 @@ def generate_demand(
 
             component_class = str(component["component_class"])
             demand_probability = config.customer_demand_probability[component_class]
-            if rng.random() > demand_probability:
+            if demand_rng.random() > demand_probability:
                 continue
 
             low, high = config.customer_demand_quantity_range[component_class]
-            demand.append(
-                {
-                    "demand_id": f"DEMAND_{len(demand) + 1}",
-                    "node_id": node["node_id"],
-                    "component_id": component["component_id"],
-                    "quantity": rng.randint(low, high),
-                }
+            append_demand_rows(
+                demand,
+                node["node_id"],
+                component["component_id"],
+                demand_rng.randint(low, high),
+                config,
+                schedule_rng,
             )
 
         # Guarantee every customer has at least one demand row. This keeps
@@ -983,19 +1011,78 @@ def generate_demand(
             top_level_components = [
                 component for component in components if int(component["indenture_level"]) == 1
             ]
-            component = rng.choice(top_level_components)
+            component = demand_rng.choice(top_level_components)
             component_class = str(component["component_class"])
             low, high = config.customer_demand_quantity_range[component_class]
-            demand.append(
-                {
-                    "demand_id": f"DEMAND_{len(demand) + 1}",
-                    "node_id": node["node_id"],
-                    "component_id": component["component_id"],
-                    "quantity": rng.randint(low, high),
-                }
+            append_demand_rows(
+                demand,
+                node["node_id"],
+                component["component_id"],
+                demand_rng.randint(low, high),
+                config,
+                schedule_rng,
             )
 
     return demand
+
+
+def split_quantity_across_days(
+    quantity: int, day_count: int, rng: random.Random
+) -> list[int]:
+    """Split one demand quantity across daily demand slices."""
+
+    if quantity <= 0:
+        return [0] * day_count
+
+    if quantity == 1:
+        day_quantities = [0] * day_count
+        day_quantities[rng.randrange(day_count)] = 1
+        return day_quantities
+
+    scheduled_day_count = rng.randint(2, min(quantity, day_count))
+    scheduled_days = rng.sample(range(day_count), k=scheduled_day_count)
+    day_quantities = [0] * day_count
+    for demand_day in scheduled_days:
+        day_quantities[demand_day] = 1
+    for _ in range(quantity - scheduled_day_count):
+        day_quantities[rng.choice(scheduled_days)] += 1
+
+    return day_quantities
+
+
+def append_demand_rows(
+    demand: list[dict[str, object]],
+    node_id: object,
+    component_id: object,
+    quantity: int,
+    config: GeneratorConfig,
+    rng: random.Random,
+) -> None:
+    """Append one demand row for one customer/component request."""
+
+    if config.complexity < 3:
+        demand.append(
+            {
+                "demand_id": f"DEMAND_{len(demand) + 1}",
+                "node_id": node_id,
+                "component_id": component_id,
+                "quantity": quantity,
+            }
+        )
+        return
+
+    demand_row = {
+        "demand_id": f"DEMAND_{len(demand) + 1}",
+        "node_id": node_id,
+        "component_id": component_id,
+        "quantity": quantity,
+    }
+    for slice_index, day_quantity in enumerate(
+        split_quantity_across_days(quantity, config.level3_demand_day_count, rng),
+        start=1,
+    ):
+        demand_row[f"time_slice_{slice_index}"] = day_quantity
+    demand.append(demand_row)
 
 
 def generate_repair_options(
@@ -1040,21 +1127,7 @@ def generate_repair_options(
                 cost_multiplier = config.repair_cost_multiplier_by_type[node_type]
                 repair_option["repair_cost_multiplier"] = cost_multiplier
                 if config.complexity >= 2:
-                    component_class = str(component["component_class"])
-                    combination_time = 0.0
-                    for child in children_by_parent.get(str(component["component_id"]), []):
-                        child_component = component_by_id[str(child["child_component_id"])]
-                        child_class = str(child_component["component_class"])
-                        quantity_required = int(child["quantity_required"])
-                        combination_time += (
-                            config.repair_combination_time_by_child_class[child_class]
-                            * quantity_required
-                        )
-
                     time_multiplier = config.repair_time_multiplier_by_type[node_type]
-                    base_repair_time = config.repair_base_time_by_class[component_class]
-                    repair_time = max(1, round(base_repair_time + combination_time))
-                    repair_option["repair_time"] = repair_time
                     repair_option["repair_time_multiplier"] = time_multiplier
             repair_options.append(repair_option)
 
@@ -1079,6 +1152,32 @@ def arc_cost_between(node_a: dict[str, object], node_b: dict[str, object]) -> in
     return round(distance_between(node_a, node_b))
 
 
+def arc_time_parameters_for_route(
+    from_node_type: str,
+    to_node_type: str,
+    config: GeneratorConfig,
+) -> tuple[float, int]:
+    """Return route-specific arc time parameters."""
+
+    route = (from_node_type, to_node_type)
+    reverse_route = (to_node_type, from_node_type)
+    if route in config.arc_time_parameters_by_route:
+        return config.arc_time_parameters_by_route[route]
+    return config.arc_time_parameters_by_route[reverse_route]
+
+
+def arc_time_between(
+    node_a: dict[str, object], node_b: dict[str, object], config: GeneratorConfig
+) -> int:
+    """Calculate whole-number arc time from distance and route type."""
+
+    distance = distance_between(node_a, node_b)
+    multiplier, fixed_overhead = arc_time_parameters_for_route(
+        str(node_a["node_type"]), str(node_b["node_type"]), config
+    )
+    return round(distance * multiplier + fixed_overhead)
+
+
 def nearest_nodes(
     source: dict[str, object], candidates: list[dict[str, object]], connection_count: int
 ) -> list[dict[str, object]]:
@@ -1099,26 +1198,29 @@ def add_bidirectional_arc_pair(
     connected_pairs: set[tuple[str, str]],
     node_a: dict[str, object],
     node_b: dict[str, object],
+    config: GeneratorConfig,
 ) -> None:
     """Add both travel directions between two nodes if not already present."""
 
     node_a_id = str(node_a["node_id"])
     node_b_id = str(node_b["node_id"])
     cost = arc_cost_between(node_a, node_b)
+    time_cost = arc_time_between(node_a, node_b, config) if config.complexity >= 2 else None
 
     for from_node, to_node in ((node_a_id, node_b_id), (node_b_id, node_a_id)):
         if (from_node, to_node) in connected_pairs:
             continue
 
         connected_pairs.add((from_node, to_node))
-        arcs.append(
-            {
-                "arc_id": f"ARC_{len(arcs) + 1}",
-                "from_node": from_node,
-                "to_node": to_node,
-                "cost": cost,
-            }
-        )
+        arc = {
+            "arc_id": f"ARC_{len(arcs) + 1}",
+            "from_node": from_node,
+            "to_node": to_node,
+            "cost": cost,
+        }
+        if time_cost is not None:
+            arc["time_cost"] = time_cost
+        arcs.append(arc)
 
 
 def generate_arcs(nodes: list[dict[str, object]], config: GeneratorConfig) -> list[dict[str, object]]:
@@ -1149,7 +1251,7 @@ def generate_arcs(nodes: list[dict[str, object]], config: GeneratorConfig) -> li
         target_nodes = nodes_by_type[target_type]
         for source in nodes_by_type[source_type]:
             for target in nearest_nodes(source, target_nodes, connection_count):
-                add_bidirectional_arc_pair(arcs, connected_pairs, source, target)
+                add_bidirectional_arc_pair(arcs, connected_pairs, source, target, config)
 
     return arcs
 
@@ -1408,9 +1510,19 @@ def visualization_maps(
         )
     demand_by_node: dict[str, list[str]] = {str(node["node_id"]): [] for node in nodes}
     for row in demand:
-        demand_by_node[str(row["node_id"])].append(
-            f"{row['component_id']}:{row['quantity']}"
-        )
+        demand_summary = f"{row['component_id']}:{row['quantity']}"
+        time_slice_items = [
+            f"t{slice_index}:{row[f'time_slice_{slice_index}']}"
+            for slice_index in sorted(
+                int(key.removeprefix("time_slice_"))
+                for key in row
+                if key.startswith("time_slice_")
+            )
+            if f"time_slice_{slice_index}" in row and int(row[f"time_slice_{slice_index}"]) > 0
+        ]
+        if time_slice_items:
+            demand_summary = f"{demand_summary} ({', '.join(time_slice_items)})"
+        demand_by_node[str(row["node_id"])].append(demand_summary)
     return node_by_id, inventory_by_node, demand_by_node
 
 
@@ -1704,6 +1816,7 @@ def write_cost_formula_markdown(path: Path, config: GeneratorConfig) -> None:
                 "repair_cost_multiplier = location_cost_multiplier",
                 "repair_time = round(base_repair_time + combination_time)",
                 "repair_time_multiplier = location_time_multiplier",
+                "arc_time_cost = round(distance * route_time_multiplier + fixed_route_time)",
                 "```",
                 "",
                 "```text",
@@ -1726,12 +1839,14 @@ def write_cost_formula_markdown(path: Path, config: GeneratorConfig) -> None:
                 "    child_combination_time = 2.0 * quantity_required",
                 "```",
                 "",
-                "Specialized shops are fastest and central depots are slowest.",
+                "Regional warehouse to central depot routes are fastest.",
+                "Routes involving specialized shops are slowest.",
                 "LRU repair takes longer than SRU repair because `LRU` assembly combines `SRU` children with a higher per-child time than `SRU` assembly uses for `PART` children.",
             ]
         )
+        level_label = "--complexity 3" if config.complexity >= 3 else "--complexity 2"
         level_description = (
-            "Only `LRU_*` and `LRU_*_*` components are repairable at `--complexity 2`. "
+            f"Only `LRU_*` and `LRU_*_*` components are repairable at `{level_label}`. "
             "Shared `PART_*` items are used to build repairs but are not themselves repair options."
         )
     else:
@@ -2075,6 +2190,14 @@ def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) 
         writer.writerows(rows)
 
 
+def export_rows(
+    rows: list[dict[str, object]], fieldnames: list[str]
+) -> list[dict[str, object]]:
+    """Project rows onto the exported schema order."""
+
+    return [{field: row.get(field, "") for field in fieldnames} for row in rows]
+
+
 def node_fieldnames(config: GeneratorConfig) -> list[str]:
     """Return the nodes.csv schema for the selected complexity level."""
 
@@ -2085,14 +2208,24 @@ def node_fieldnames(config: GeneratorConfig) -> list[str]:
 
 
 def repair_option_fieldnames(config: GeneratorConfig) -> list[str]:
-    """Return the component_multipler.csv schema for the selected complexity level."""
+    """Return the component_multiplier.csv schema for the selected complexity level."""
 
     fieldnames = ["node_id", "component_id"]
     if config.complexity >= 1:
         fieldnames.append("repair_cost_multiplier")
     if config.complexity >= 2:
-        fieldnames.append("repair_time")
         fieldnames.append("repair_time_multiplier")
+    return fieldnames
+
+
+def demand_fieldnames(config: GeneratorConfig) -> list[str]:
+    """Return the demand.csv schema for the selected complexity level."""
+
+    fieldnames = ["demand_id", "node_id", "component_id", "quantity"]
+    if config.complexity >= 3:
+        fieldnames.extend(
+            [f"time_slice_{slice_index}" for slice_index in range(1, config.level3_demand_day_count + 1)]
+        )
     return fieldnames
 
 
@@ -2151,11 +2284,16 @@ def main() -> None:
             **component_count_config_from_total(args.components),
         ),
     )
-    rng = random.Random(config.seed)
+    node_rng = random.Random(config.seed + 1000)
+    component_rng = random.Random(config.seed + 2000)
+    inventory_rng = random.Random(config.seed + 3000)
+    demand_rng = random.Random(config.seed + 4000)
+    demand_schedule_rng = random.Random(config.seed + 5000)
+    bom_reconcile_rng = random.Random(config.seed + 6000)
     output_dir = Path(args.output_dir)
-    obsolete_filenames = ["customers.csv", "repair_options.csv"]
+    obsolete_filenames = ["customers.csv", "repair_options.csv", "component_multipler.csv"]
     if config.complexity == 0:
-        obsolete_filenames.extend(["components.csv", "component_multipler.csv"])
+        obsolete_filenames.extend(["components.csv", "component_multiplier.csv"])
     for obsolete_filename in obsolete_filenames:
         obsolete_path = output_dir / obsolete_filename
         if obsolete_path.exists():
@@ -2163,12 +2301,18 @@ def main() -> None:
 
     # Generation order matters: inventory and demand both use node attributes
     # and component attributes.
-    nodes = generate_nodes(config, rng)
-    components, bom_rows = generate_components_and_bom(config, rng)
+    nodes = generate_nodes(config, node_rng)
+    components, bom_rows = generate_components_and_bom(config, component_rng)
     if config.complexity == 0:
         components = components_used_by_bom(components, bom_rows)
-    inventory = generate_inventory(nodes, components, config, rng)
-    demand = generate_demand(nodes, components, config, rng)
+    inventory = generate_inventory(nodes, components, config, inventory_rng)
+    demand = generate_demand(
+        nodes,
+        components,
+        config,
+        demand_rng,
+        demand_schedule_rng,
+    )
     if config.complexity == 0:
         ensure_demand_can_be_met_through_bom(
             inventory,
@@ -2177,7 +2321,7 @@ def main() -> None:
             bom_rows,
             demand,
             config,
-            rng,
+            bom_reconcile_rng,
         )
     arcs = generate_arcs(nodes, config)
     repair_options = (
@@ -2199,11 +2343,8 @@ def main() -> None:
             "component_id",
             "component_class",
             "subsystem",
-            "repair_difficulty",
             "component_cost",
         ]
-        if config.complexity >= 3:
-            component_fieldnames.append("movement_cost")
         component_fieldnames.extend(
             [
                 "indenture_level",
@@ -2213,22 +2354,24 @@ def main() -> None:
         )
         write_csv(
             output_dir / "components.csv",
-            components,
+            export_rows(components, component_fieldnames),
             component_fieldnames,
         )
     bom_fieldnames = [
         "parent_component_id",
         "parent_component_class",
+        "parent_component_repair_difficulty",
         "parent_component_cost",
         "child_component_id",
         "child_component_class",
+        "child_component_repair_difficulty",
         "child_component_cost",
     ]
-    if config.complexity >= 3:
+    if config.complexity >= 2:
         bom_fieldnames.extend(
             [
-                "parent_component_movement_cost",
-                "child_component_movement_cost",
+                "parent_component_repair_time",
+                "child_component_repair_time",
             ]
         )
     bom_fieldnames.extend(
@@ -2250,16 +2393,19 @@ def main() -> None:
     write_csv(
         output_dir / "demand.csv",
         demand,
-        ["demand_id", "node_id", "component_id", "quantity"],
+        demand_fieldnames(config),
     )
+    arc_fieldnames = ["arc_id", "from_node", "to_node", "cost"]
+    if config.complexity >= 2:
+        arc_fieldnames.append("time_cost")
     write_csv(
         output_dir / "arcs.csv",
         arcs,
-        ["arc_id", "from_node", "to_node", "cost"],
+        arc_fieldnames,
     )
     if config.complexity >= 1:
         write_csv(
-            output_dir / "component_multipler.csv",
+            output_dir / "component_multiplier.csv",
             repair_options,
             repair_option_fieldnames(config),
         )
